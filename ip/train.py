@@ -91,7 +91,7 @@ if __name__ == '__main__':
         max_steps=config['num_iters'],
         enable_progress_bar=True,
         precision='16-mixed',
-        val_check_interval=20000,  # TODO: might want to change that.
+        val_check_interval=5000,
         num_sanity_val_steps=2,
         check_val_every_n_epoch=None,
         logger=logger,

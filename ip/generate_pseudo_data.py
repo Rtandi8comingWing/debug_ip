@@ -4,15 +4,14 @@ Generates synthetic task demonstrations from ShapeNet objects (or primitive fall
 and saves them in the format expected by save_sample() → RunningDataset → train.py.
 """
 import os
-import sys
+os.environ.setdefault('PYOPENGL_PLATFORM', 'egl')
+
 import argparse
 import glob as glob_mod
 import numpy as np
 import trimesh
 import pyrender
 from scipy.spatial.transform import Rotation as Rot, Slerp
-from multiprocessing import Pool
-from functools import partial
 
 from ip.utils.data_proc import save_sample, sample_to_cond_demo, sample_to_live
 
@@ -20,6 +19,40 @@ from ip.utils.data_proc import save_sample, sample_to_cond_demo, sample_to_live
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Scene construction
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def normalize(vec, fallback=None):
+    vec = np.asarray(vec, dtype=np.float64)
+    norm = np.linalg.norm(vec)
+    if norm < 1e-8:
+        if fallback is None:
+            return None
+        fallback = np.asarray(fallback, dtype=np.float64)
+        fallback_norm = np.linalg.norm(fallback)
+        if fallback_norm < 1e-8:
+            return None
+        return fallback / fallback_norm
+    return vec / norm
+
+
+def horizontal(vec):
+    if vec is None:
+        return None
+    vec = np.asarray(vec, dtype=np.float64).copy()
+    vec[2] = 0.0
+    return normalize(vec)
+
+
+def clamp_above_table(point, min_z=0.02):
+    point = np.asarray(point, dtype=np.float64).copy()
+    point[2] = max(point[2], min_z)
+    return point
+
+
+def local_to_world(T_w_obj, point_local):
+    point_local = np.asarray(point_local, dtype=np.float64)
+    return (T_w_obj[:3, :3] @ point_local.T).T + T_w_obj[:3, 3]
+
 
 def load_shapenet_meshes(shapenet_path, n=2):
     """Load n random ShapeNet meshes."""
@@ -65,23 +98,19 @@ def create_scene(shapenet_path=None, num_objects=2):
 
     scene_objects = []
     for mesh in meshes:
-        # Normalize to unit bounding box then scale to 5-15cm
         ext = mesh.bounding_box.extents
         mesh.apply_scale(1.0 / max(ext))
         target_size = np.random.uniform(0.05, 0.15)
         mesh.apply_scale(target_size)
 
-        # Random position on table (z=0 is table surface)
         x = np.random.uniform(-0.15, 0.15)
         y = np.random.uniform(-0.15, 0.15)
-        z = mesh.bounding_box.extents[2] / 2.0  # sit on table
+        z = mesh.bounding_box.extents[2] / 2.0
 
-        # Random yaw in [-pi/3, pi/3] (Appendix F)
         yaw = np.random.uniform(-np.pi / 3, np.pi / 3)
         T_w_obj = np.eye(4)
         T_w_obj[:3, :3] = Rot.from_euler('z', yaw).as_matrix()
         T_w_obj[:3, 3] = [x, y, z]
-
         scene_objects.append((mesh, T_w_obj))
     return scene_objects
 
@@ -90,78 +119,299 @@ def create_scene(shapenet_path=None, num_objects=2):
 # 2. Pseudo-task sampling
 # ──────────────────────────────────────────────────────────────────────────────
 
-def sample_point_near_object(mesh, T_w_obj, offset=0.03):
-    """Sample a point on or near an object surface."""
-    pts = mesh.sample(1)
-    pt_world = (T_w_obj[:3, :3] @ pts.T).T + T_w_obj[:3, 3]
-    pt_world = pt_world.flatten() + np.random.uniform(-offset, offset, 3)
-    pt_world[2] = max(pt_world[2], 0.02)  # stay above table
-    return pt_world
+
+def make_waypoint(pos, grip, stage, obj_idx=None, dir_hint=None):
+    return {
+        'pos': clamp_above_table(pos),
+        'grip': int(grip),
+        'stage': stage,
+        'obj_idx': obj_idx,
+        'dir_hint': None if dir_hint is None else np.asarray(dir_hint, dtype=np.float64),
+    }
+
+
+def top_point(mesh, T_w_obj, xy_scale=0.15, z_offset=0.0):
+    ext = mesh.bounding_box.extents
+    local = np.array([
+        np.random.uniform(-xy_scale, xy_scale) * ext[0],
+        np.random.uniform(-xy_scale, xy_scale) * ext[1],
+        ext[2] / 2.0 + z_offset,
+    ])
+    return clamp_above_table(local_to_world(T_w_obj, local))
+
+
+def side_point(mesh, T_w_obj, axis=0, sign=1.0, z_ratio=0.55, clearance=0.005):
+    ext = mesh.bounding_box.extents
+    other_axis = 1 - axis
+    local = np.zeros(3)
+    local[axis] = sign * (ext[axis] / 2.0 + clearance)
+    local[other_axis] = np.random.uniform(-0.2, 0.2) * ext[other_axis]
+    local[2] = (z_ratio - 0.5) * ext[2]
+    return clamp_above_table(local_to_world(T_w_obj, local), min_z=0.03)
+
+
+def random_workspace_point(z_low=0.03, z_high=0.12):
+    return np.array([
+        np.random.uniform(-0.18, 0.18),
+        np.random.uniform(-0.18, 0.18),
+        np.random.uniform(z_low, z_high),
+    ], dtype=np.float64)
+
+
+def object_frame_dirs(T_w_obj):
+    return T_w_obj[:3, 0].copy(), T_w_obj[:3, 1].copy(), T_w_obj[:3, 2].copy(), T_w_obj[:3, 3].copy()
+
+
+def select_task_waypoints(waypoints, target_count):
+    if len(waypoints) <= target_count:
+        return waypoints
+
+    ordered = [0, len(waypoints) - 1]
+    for i in range(1, len(waypoints) - 1):
+        if waypoints[i]['grip'] != waypoints[i - 1]['grip']:
+            ordered.append(i)
+
+    important_stages = ['grasp', 'contact', 'place', 'release', 'lift', 'transfer', 'pull', 'push', 'settle',
+                        'retreat', 'approach', 'pregrasp']
+    for stage in important_stages:
+        for i, waypoint in enumerate(waypoints[1:-1], start=1):
+            if waypoint['stage'] == stage:
+                ordered.append(i)
+
+    ordered.extend(np.round(np.linspace(0, len(waypoints) - 1, target_count)).astype(int).tolist())
+    ordered.extend(range(len(waypoints)))
+
+    selected = []
+    for idx in ordered:
+        idx = int(idx)
+        if idx not in selected:
+            selected.append(idx)
+        if len(selected) == target_count:
+            break
+
+    return [waypoints[i] for i in sorted(selected)]
+
+
+def build_grasp_task(scene_objects):
+    obj_idx = np.random.randint(len(scene_objects))
+    mesh, T_w_obj = scene_objects[obj_idx]
+    obj_x, obj_y, _, center = object_frame_dirs(T_w_obj)
+    align_dir = obj_x if np.random.random() < 0.5 else obj_y
+
+    grasp = top_point(mesh, T_w_obj, xy_scale=0.12, z_offset=0.0)
+    approach = grasp + np.array([0.0, 0.0, np.random.uniform(0.06, 0.10)])
+    pregrasp = grasp + np.array([0.0, 0.0, np.random.uniform(0.015, 0.03)])
+    retreat = grasp + np.array([0.0, 0.0, np.random.uniform(0.08, 0.12)])
+
+    return [
+        make_waypoint(approach, 0, 'approach', obj_idx, dir_hint=center - approach),
+        make_waypoint(pregrasp, 0, 'pregrasp', obj_idx, dir_hint=center - pregrasp),
+        make_waypoint(grasp, 1, 'grasp', obj_idx, dir_hint=align_dir),
+        make_waypoint(retreat, 1, 'retreat', obj_idx, dir_hint=align_dir),
+    ]
+
+
+def build_pick_place_task(scene_objects):
+    src_idx = np.random.randint(len(scene_objects))
+    dst_idx = (src_idx + 1) % len(scene_objects)
+    src_mesh, T_src = scene_objects[src_idx]
+    dst_mesh, T_dst = scene_objects[dst_idx]
+    src_x, _, _, src_center = object_frame_dirs(T_src)
+    _, dst_y, _, dst_center = object_frame_dirs(T_dst)
+
+    grasp = top_point(src_mesh, T_src, xy_scale=0.1, z_offset=0.0)
+    approach = grasp + np.array([0.0, 0.0, np.random.uniform(0.07, 0.10)])
+    lift = grasp + np.array([0.0, 0.0, np.random.uniform(0.08, 0.14)])
+    place = top_point(dst_mesh, T_dst, xy_scale=0.15, z_offset=0.01)
+    transfer = place + np.array([0.0, 0.0, np.random.uniform(0.06, 0.10)])
+    release = place + np.array([0.0, 0.0, np.random.uniform(0.04, 0.07)])
+
+    transfer_dir = transfer - lift
+    place_dir = dst_center - place
+    return [
+        make_waypoint(approach, 0, 'approach', src_idx, dir_hint=src_center - approach),
+        make_waypoint(grasp, 1, 'grasp', src_idx, dir_hint=src_x),
+        make_waypoint(lift, 1, 'lift', src_idx, dir_hint=transfer_dir),
+        make_waypoint(transfer, 1, 'transfer', dst_idx, dir_hint=transfer_dir),
+        make_waypoint(place, 1, 'place', dst_idx, dir_hint=place_dir),
+        make_waypoint(release, 0, 'release', dst_idx, dir_hint=dst_y),
+    ]
+
+
+def build_opening_task(scene_objects):
+    obj_idx = np.random.randint(len(scene_objects))
+    mesh, T_w_obj = scene_objects[obj_idx]
+    obj_x, obj_y, _, center = object_frame_dirs(T_w_obj)
+    axis = np.random.randint(2)
+    sign = np.random.choice([-1.0, 1.0])
+    radial_dir = (obj_x if axis == 0 else obj_y) * sign
+    tangent_dir = (obj_y if axis == 0 else obj_x) * np.random.choice([-1.0, 1.0])
+
+    contact = side_point(mesh, T_w_obj, axis=axis, sign=sign, z_ratio=0.6, clearance=0.004)
+    approach = contact - tangent_dir * np.random.uniform(0.04, 0.06) + np.array([0.0, 0.0, 0.05])
+    sweep = contact + tangent_dir * np.random.uniform(0.05, 0.08) + radial_dir * 0.01
+    pull = sweep + tangent_dir * np.random.uniform(0.03, 0.05) + np.array([0.0, 0.0, 0.02])
+    release = pull + np.array([0.0, 0.0, 0.04])
+
+    return [
+        make_waypoint(approach, 0, 'approach', obj_idx, dir_hint=center - approach),
+        make_waypoint(contact, 1, 'contact', obj_idx, dir_hint=tangent_dir),
+        make_waypoint(sweep, 1, 'sweep', obj_idx, dir_hint=tangent_dir),
+        make_waypoint(pull, 1, 'pull', obj_idx, dir_hint=tangent_dir),
+        make_waypoint(release, 0, 'release', obj_idx, dir_hint=radial_dir),
+    ]
+
+
+def build_closing_task(scene_objects):
+    obj_idx = np.random.randint(len(scene_objects))
+    mesh, T_w_obj = scene_objects[obj_idx]
+    obj_x, obj_y, _, center = object_frame_dirs(T_w_obj)
+    axis = np.random.randint(2)
+    sign = np.random.choice([-1.0, 1.0])
+    radial_dir = (obj_x if axis == 0 else obj_y) * sign
+    tangent_dir = (obj_y if axis == 0 else obj_x) * np.random.choice([-1.0, 1.0])
+
+    contact = side_point(mesh, T_w_obj, axis=axis, sign=sign, z_ratio=0.55, clearance=0.006)
+    approach = contact - tangent_dir * np.random.uniform(0.05, 0.07) + np.array([0.0, 0.0, 0.04])
+    push = contact + tangent_dir * np.random.uniform(0.05, 0.08) - radial_dir * 0.015
+    settle = push - tangent_dir * np.random.uniform(0.01, 0.03)
+    release = settle + np.array([0.0, 0.0, 0.04])
+
+    return [
+        make_waypoint(approach, 0, 'approach', obj_idx, dir_hint=center - approach),
+        make_waypoint(contact, 1, 'contact', obj_idx, dir_hint=tangent_dir),
+        make_waypoint(push, 1, 'push', obj_idx, dir_hint=tangent_dir),
+        make_waypoint(settle, 1, 'settle', obj_idx, dir_hint=-radial_dir),
+        make_waypoint(release, 0, 'release', obj_idx, dir_hint=radial_dir),
+    ]
+
+
+def build_random_task(scene_objects, num_waypoints):
+    waypoints = []
+    grip = 0
+    for _ in range(num_waypoints):
+        obj_idx = np.random.randint(len(scene_objects))
+        mesh, T_w_obj = scene_objects[obj_idx]
+        center = T_w_obj[:3, 3]
+        if np.random.random() < 0.25:
+            grip = 1 - grip
+        if np.random.random() < 0.5:
+            pt = top_point(mesh, T_w_obj, xy_scale=0.3, z_offset=np.random.uniform(0.0, 0.04))
+        else:
+            pt = side_point(mesh, T_w_obj, axis=np.random.randint(2), sign=np.random.choice([-1.0, 1.0]),
+                            z_ratio=np.random.uniform(0.45, 0.7), clearance=np.random.uniform(0.004, 0.02))
+        pt += np.random.normal(0, 0.01, 3)
+        pt = clamp_above_table(pt)
+        waypoints.append(make_waypoint(pt, grip, 'random', obj_idx, dir_hint=center - pt))
+    return waypoints
 
 
 def sample_pseudo_task(scene_objects):
     """
     Sample 2-6 waypoints for a pseudo-task.
-    50% biased (grasp/pick-place patterns), 50% random.
-    Returns list of (position, grip_state) tuples.
+    50% biased (grasp/pick-place/open/close patterns), 50% random.
+    Returns a list of waypoint dictionaries.
     """
     num_waypoints = np.random.randint(2, 7)
-    waypoints = []
-
     biased = np.random.random() < 0.5
 
-    if biased and len(scene_objects) >= 1:
-        obj_idx = np.random.randint(len(scene_objects))
-        mesh, T_w_obj = scene_objects[obj_idx]
+    if not biased:
+        return build_random_task(scene_objects, num_waypoints)
 
-        # Approach
-        approach_pt = sample_point_near_object(mesh, T_w_obj, offset=0.06)
-        approach_pt[2] += 0.05
-        waypoints.append((approach_pt, 0))
-
-        # Grasp
-        grasp_pt = sample_point_near_object(mesh, T_w_obj, offset=0.01)
-        waypoints.append((grasp_pt, 1))
-
-        # Lift
-        lift_pt = grasp_pt.copy()
-        lift_pt[2] += np.random.uniform(0.05, 0.15)
-        waypoints.append((lift_pt, 1))
-
-        # Place
-        if len(scene_objects) > 1:
-            other_idx = (obj_idx + 1) % len(scene_objects)
-            place_pt = sample_point_near_object(scene_objects[other_idx][0],
-                                                scene_objects[other_idx][1], offset=0.05)
-            place_pt[2] += 0.02
-        else:
-            place_pt = np.array([np.random.uniform(-0.15, 0.15),
-                                 np.random.uniform(-0.15, 0.15),
-                                 np.random.uniform(0.02, 0.08)])
-        waypoints.append((place_pt, 1))
-
-        # Release
-        release_pt = place_pt.copy()
-        release_pt[2] += 0.03
-        waypoints.append((release_pt, 0))
-
-        waypoints = waypoints[:num_waypoints]
-    else:
-        grip = 0
-        for _ in range(num_waypoints):
-            obj_idx = np.random.randint(len(scene_objects))
-            mesh, T_w_obj = scene_objects[obj_idx]
-            pt = sample_point_near_object(mesh, T_w_obj, offset=0.08)
-            if np.random.random() < 0.3:
-                grip = 1 - grip
-            waypoints.append((pt, grip))
-
-    return waypoints
+    family_builders = [
+        build_grasp_task,
+        build_pick_place_task,
+        build_opening_task,
+        build_closing_task,
+    ]
+    waypoints = family_builders[np.random.randint(len(family_builders))](scene_objects)
+    return select_task_waypoints(waypoints, num_waypoints)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Trajectory generation
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def build_downward_orientation(primary_dir=None, prev_R=None, continuity=0.0, tilt_deg=0.0):
+    z_axis = np.array([0.0, 0.0, -1.0])
+    x_axis = horizontal(primary_dir)
+
+    if prev_R is not None:
+        prev_x = horizontal(prev_R[:3, 0])
+        if prev_x is not None:
+            if x_axis is None:
+                x_axis = prev_x
+            else:
+                x_axis = normalize((1.0 - continuity) * x_axis + continuity * prev_x, fallback=prev_x)
+
+    if x_axis is None:
+        x_axis = np.array([1.0, 0.0, 0.0])
+
+    y_axis = normalize(np.cross(z_axis, x_axis), fallback=np.array([0.0, 1.0, 0.0]))
+    x_axis = normalize(np.cross(y_axis, z_axis), fallback=np.array([1.0, 0.0, 0.0]))
+    R = np.column_stack([x_axis, y_axis, z_axis])
+
+    if tilt_deg > 0:
+        tilt = Rot.from_euler('xy', np.random.uniform(-tilt_deg, tilt_deg, 2), degrees=True)
+        R = R @ tilt.as_matrix()
+    return R
+
+
+def blend_directions(*weighted_dirs):
+    accum = np.zeros(3, dtype=np.float64)
+    for weight, direction in weighted_dirs:
+        direction = horizontal(direction)
+        if direction is not None:
+            accum += weight * direction
+    return normalize(accum)
+
+
+def waypoint_orientation(waypoint, prev_pose, next_waypoint, scene_objects):
+    stage = waypoint['stage']
+    obj_dir = None
+    if waypoint['obj_idx'] is not None:
+        obj_dir = scene_objects[waypoint['obj_idx']][1][:3, 3] - waypoint['pos']
+    move_dir = None if next_waypoint is None else next_waypoint['pos'] - waypoint['pos']
+    prev_dir = None if prev_pose is None else waypoint['pos'] - prev_pose[:3, 3]
+
+    if stage in {'approach', 'pregrasp', 'grasp', 'contact'}:
+        primary_dir = blend_directions(
+            (0.55, obj_dir),
+            (0.30, waypoint['dir_hint']),
+            (0.15, move_dir),
+        )
+        continuity = 0.35
+        tilt_deg = 8.0
+    elif stage in {'lift', 'transfer', 'place', 'release', 'retreat'}:
+        primary_dir = blend_directions(
+            (0.45, waypoint['dir_hint']),
+            (0.30, move_dir),
+            (0.25, prev_dir),
+        )
+        continuity = 0.75
+        tilt_deg = 5.0
+    elif stage in {'sweep', 'pull', 'push', 'settle'}:
+        primary_dir = blend_directions(
+            (0.50, waypoint['dir_hint']),
+            (0.25, move_dir),
+            (0.25, obj_dir),
+        )
+        continuity = 0.65
+        tilt_deg = 6.0
+    else:
+        primary_dir = blend_directions(
+            (0.45, waypoint['dir_hint']),
+            (0.30, move_dir),
+            (0.25, prev_dir),
+        )
+        continuity = 0.6
+        tilt_deg = 8.0
+
+    prev_R = None if prev_pose is None else prev_pose[:3, :3]
+    return build_downward_orientation(primary_dir=primary_dir, prev_R=prev_R,
+                                      continuity=continuity, tilt_deg=tilt_deg)
+
 
 def interpolate_poses(T_start, T_end, trans_step=0.01, rot_step_deg=3.0):
     """
@@ -193,16 +443,19 @@ def interpolate_poses(T_start, T_end, trans_step=0.01, rot_step_deg=3.0):
     return poses
 
 
-def sample_ee_orientation():
-    """Sample a random but reasonable EE orientation (roughly pointing down)."""
-    # Base: z-axis pointing down
-    base_rot = Rot.from_euler('x', 180, degrees=True)
-    # Add random perturbation
-    perturb = Rot.from_euler('xyz',
-                             [np.random.uniform(-40, 40),
-                              np.random.uniform(-40, 40),
-                              np.random.uniform(-180, 180)], degrees=True)
-    return (base_rot * perturb).as_matrix()
+def stage_dwell_count(stage):
+    return {
+        'grasp': 3,
+        'contact': 3,
+        'place': 3,
+        'release': 2,
+        'lift': 1,
+        'transfer': 1,
+        'retreat': 1,
+        'pull': 1,
+        'push': 1,
+        'settle': 2,
+    }.get(stage, 0)
 
 
 def generate_trajectory(scene_objects, task_waypoints, trans_step=0.01, rot_step_deg=3.0):
@@ -210,56 +463,60 @@ def generate_trajectory(scene_objects, task_waypoints, trans_step=0.01, rot_step
     Generate a full trajectory from task waypoints.
     Returns (traj_poses, traj_grips, obj_transforms_per_frame).
     """
-    # Random starting EE pose above the scene
+    first_target = task_waypoints[0]
     T_start = np.eye(4)
-    T_start[:3, :3] = sample_ee_orientation()
-    T_start[:3, 3] = [np.random.uniform(-0.1, 0.1),
-                       np.random.uniform(-0.1, 0.1),
-                       np.random.uniform(0.2, 0.35)]
+    T_start[:3, 3] = first_target['pos'] + np.array([
+        np.random.uniform(-0.03, 0.03),
+        np.random.uniform(-0.03, 0.03),
+        np.random.uniform(0.18, 0.28),
+    ])
+    T_start[:3, :3] = build_downward_orientation(
+        primary_dir=first_target['pos'] - T_start[:3, 3],
+        continuity=0.0,
+        tilt_deg=10.0,
+    )
 
-    # Build waypoint poses (position from task, orientation smoothly varied)
     wp_poses = [T_start]
-    wp_grips = [task_waypoints[0][1] if task_waypoints else 0]
-
-    for pos, grip in task_waypoints:
+    wp_grips = [first_target['grip']]
+    prev_pose = T_start
+    for i, waypoint in enumerate(task_waypoints):
+        next_waypoint = task_waypoints[i + 1] if i + 1 < len(task_waypoints) else None
         T_wp = np.eye(4)
-        T_wp[:3, :3] = sample_ee_orientation()
-        T_wp[:3, 3] = pos
+        T_wp[:3, 3] = waypoint['pos']
+        T_wp[:3, :3] = waypoint_orientation(waypoint, prev_pose, next_waypoint, scene_objects)
         wp_poses.append(T_wp)
-        wp_grips.append(grip)
+        wp_grips.append(waypoint['grip'])
+        prev_pose = T_wp
 
-    # Interpolate between consecutive waypoints
-    traj_poses = []
-    traj_grips = []
-    for i in range(len(wp_poses) - 1):
-        segment = interpolate_poses(wp_poses[i], wp_poses[i + 1], trans_step, rot_step_deg)
-        grip_val = wp_grips[i + 1]
-        if i == 0:
-            traj_poses.extend(segment)
-            traj_grips.extend([wp_grips[i]] * (len(segment) - 1) + [grip_val])
-        else:
-            traj_poses.extend(segment[1:])  # skip duplicate
-            traj_grips.extend([grip_val] * len(segment[1:]))
+    traj_poses = [wp_poses[0]]
+    traj_grips = [wp_grips[0]]
+    for i in range(1, len(wp_poses)):
+        segment = interpolate_poses(wp_poses[i - 1], wp_poses[i], trans_step, rot_step_deg)
+        traj_poses.extend(segment[1:])
+        traj_grips.extend([wp_grips[i]] * len(segment[1:]))
+
+        dwell = stage_dwell_count(task_waypoints[i - 1]['stage'])
+        for _ in range(dwell):
+            traj_poses.append(wp_poses[i].copy())
+            traj_grips.append(wp_grips[i])
 
     if len(traj_poses) < 3:
-        # Pad with stationary frames
         for _ in range(3 - len(traj_poses)):
             traj_poses.append(traj_poses[-1].copy())
             traj_grips.append(traj_grips[-1])
 
-    # Object attach/detach logic
     attached_obj_idx = None
     T_e_obj = None
     obj_transforms = []
 
-    for i, (T_w_e, grip) in enumerate(zip(traj_poses, traj_grips)):
+    for T_w_e, grip in zip(traj_poses, traj_grips):
         frame_objs = [(m, T.copy()) for m, T in scene_objects]
 
         if grip == 1 and attached_obj_idx is None:
             ee_pos = T_w_e[:3, 3]
             min_dist = float('inf')
             best_idx = None
-            for oi, (mesh, T_w_obj) in enumerate(scene_objects):
+            for oi, (_, T_w_obj) in enumerate(scene_objects):
                 dist = np.linalg.norm(T_w_obj[:3, 3] - ee_pos)
                 if dist < min_dist:
                     min_dist = dist
@@ -271,7 +528,7 @@ def generate_trajectory(scene_objects, task_waypoints, trans_step=0.01, rot_step
         if grip == 0 and attached_obj_idx is not None:
             scene_objects[attached_obj_idx] = (
                 scene_objects[attached_obj_idx][0],
-                T_w_e @ T_e_obj
+                T_w_e @ T_e_obj,
             )
             attached_obj_idx = None
             T_e_obj = None
@@ -279,7 +536,7 @@ def generate_trajectory(scene_objects, task_waypoints, trans_step=0.01, rot_step
         if attached_obj_idx is not None and T_e_obj is not None:
             frame_objs[attached_obj_idx] = (
                 frame_objs[attached_obj_idx][0],
-                T_w_e @ T_e_obj
+                T_w_e @ T_e_obj,
             )
 
         obj_transforms.append(frame_objs)
@@ -291,6 +548,7 @@ def generate_trajectory(scene_objects, task_waypoints, trans_step=0.01, rot_step
 # 4. Point cloud rendering
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def setup_cameras(num_cameras=3):
     """Set up depth cameras around the workspace."""
     camera = pyrender.IntrinsicsCamera(fx=600, fy=600, cx=320, cy=240)
@@ -301,7 +559,6 @@ def setup_cameras(num_cameras=3):
         height = np.random.uniform(0.3, 0.5)
         cam_pos = np.array([radius * np.cos(angle), radius * np.sin(angle), height])
 
-        # Look at center of workspace
         forward = -cam_pos / np.linalg.norm(cam_pos)
         right = np.cross(forward, np.array([0, 0, 1]))
         if np.linalg.norm(right) < 1e-6:
@@ -312,7 +569,7 @@ def setup_cameras(num_cameras=3):
         T_cam = np.eye(4)
         T_cam[:3, 0] = right
         T_cam[:3, 1] = up
-        T_cam[:3, 2] = -forward  # pyrender convention: -z is forward
+        T_cam[:3, 2] = -forward
         T_cam[:3, 3] = cam_pos
         cam_poses.append(T_cam)
 
@@ -339,7 +596,6 @@ def render_object_pcds(frame_objects, camera, cam_poses, img_w=640, img_h=480, n
         finally:
             renderer.delete()
 
-        # Backproject depth to 3D
         fx, fy = camera.fx, camera.fy
         cx, cy = camera.cx, camera.cy
         v, u = np.where(depth > 0)
@@ -349,21 +605,16 @@ def render_object_pcds(frame_objects, camera, cam_poses, img_w=640, img_h=480, n
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
         pts_cam = np.stack([x, y, z], axis=-1)
-
-        # Transform to world frame
         pts_world = (cam_pose[:3, :3] @ pts_cam.T).T + cam_pose[:3, 3]
         all_points.append(pts_world)
 
     if not all_points:
-        # Fallback: sample directly from meshes
         for mesh, T_w_obj in frame_objects:
             pts = mesh.sample(num_points // max(1, len(frame_objects)))
             pts_world = (T_w_obj[:3, :3] @ pts.T).T + T_w_obj[:3, 3]
             all_points.append(pts_world)
 
     combined = np.concatenate(all_points, axis=0)
-
-    # Subsample to target number of points
     if len(combined) >= num_points:
         idx = np.random.choice(len(combined), num_points, replace=False)
     else:
@@ -375,12 +626,12 @@ def render_object_pcds(frame_objects, camera, cam_poses, img_w=640, img_h=480, n
 # 5. Data augmentation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def augment_trajectory(traj_poses, traj_grips):
-    """Apply corrective augmentation and grip noise."""
+    """Apply corrective augmentation without corrupting grip labels."""
     poses = [T.copy() for T in traj_poses]
     grips = list(traj_grips)
 
-    # 30% chance: add local perturbation (corrective augmentation)
     if np.random.random() < 0.3:
         num_perturb = np.random.randint(1, max(2, len(poses) // 4))
         for _ in range(num_perturb):
@@ -388,13 +639,6 @@ def augment_trajectory(traj_poses, traj_grips):
             poses[idx][:3, 3] += np.random.normal(0, 0.005, 3)
             perturb_rot = Rot.from_rotvec(np.random.normal(0, np.deg2rad(1.5), 3))
             poses[idx][:3, :3] = poses[idx][:3, :3] @ perturb_rot.as_matrix()
-
-    # 10% chance: flip random grip states
-    if np.random.random() < 0.1:
-        num_flip = np.random.randint(1, max(2, len(grips) // 5))
-        for _ in range(num_flip):
-            idx = np.random.randint(0, len(grips))
-            grips[idx] = 1 - grips[idx]
 
     return poses, grips
 
@@ -409,7 +653,6 @@ def sample_object_pcds(frame_objects, num_points=2048):
     for mesh, T_w_obj in frame_objects:
         pts = mesh.sample(pts_per_obj)
         pts_world = (T_w_obj[:3, :3] @ pts.T).T + T_w_obj[:3, 3]
-        # Add small noise to simulate depth sensor
         pts_world += np.random.normal(0, 0.001, pts_world.shape)
         all_points.append(pts_world)
 
@@ -425,13 +668,13 @@ def sample_object_pcds(frame_objects, num_points=2048):
 # 6. Single demonstration generation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def generate_single_demo(scene_objects, task_waypoints, camera, cam_poses,
                          num_points=2048, fast=False):
     """
     Generate one demonstration: trajectory + rendered point clouds.
     Returns {'pcds': [...], 'T_w_es': [...], 'grips': [...]}.
     """
-    # Vary object poses slightly for each demo
     varied_objects = []
     for mesh, T_w_obj in scene_objects:
         T_var = T_w_obj.copy()
@@ -441,20 +684,23 @@ def generate_single_demo(scene_objects, task_waypoints, camera, cam_poses,
         T_var[:3, :3] = T_var[:3, :3] @ Rot.from_euler('z', yaw_perturb).as_matrix()
         varied_objects.append((mesh, T_var))
 
-    # Also vary task waypoint positions slightly
     varied_waypoints = []
-    for pos, grip in task_waypoints:
-        new_pos = pos.copy() + np.random.normal(0, 0.008, 3)
-        new_pos[2] = max(new_pos[2], 0.02)
-        varied_waypoints.append((new_pos, grip))
+    for waypoint in task_waypoints:
+        new_pos = waypoint['pos'].copy() + np.random.normal(0, 0.008, 3)
+        new_pos = clamp_above_table(new_pos)
+        varied_waypoints.append({
+            'pos': new_pos,
+            'grip': waypoint['grip'],
+            'stage': waypoint['stage'],
+            'obj_idx': waypoint['obj_idx'],
+            'dir_hint': waypoint['dir_hint'],
+        })
 
     traj_poses, traj_grips, obj_transforms = generate_trajectory(
         varied_objects, varied_waypoints)
 
-    # Augment
     traj_poses, traj_grips = augment_trajectory(traj_poses, traj_grips)
 
-    # Render point clouds per frame
     pcds = []
     for i in range(len(traj_poses)):
         frame_objs = obj_transforms[min(i, len(obj_transforms) - 1)]
@@ -475,11 +721,12 @@ def generate_single_demo(scene_objects, task_waypoints, camera, cam_poses,
 # 7. Main generation + save
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_waypoints_demo,
                         pred_horizon, live_spacing_trans, live_spacing_rot,
                         scene_encoder, offset_base, fast=False):
     """Generate and save one full sample (num_demos + 1 live)."""
-    np.random.seed()  # re-seed for multiprocessing
+    np.random.seed()
 
     scene_objects = create_scene(shapenet_path)
     task_waypoints = sample_pseudo_task(scene_objects)
@@ -491,7 +738,6 @@ def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_wayp
                                     fast=fast)
         demos_raw.append(demo)
 
-    # Build full_sample in the format expected by save_sample
     full_sample = {
         'demos': [None] * num_demos,
         'live': None,
@@ -499,16 +745,13 @@ def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_wayp
 
     for i in range(num_demos):
         demo_processed = sample_to_cond_demo(demos_raw[i], num_waypoints_demo)
-        # Ensure exactly num_waypoints_demo waypoints (extract_waypoints can over/undershoot)
         n = len(demo_processed['obs'])
         if n > num_waypoints_demo:
-            # Uniformly subsample to target count
             indices = np.round(np.linspace(0, n - 1, num_waypoints_demo)).astype(int)
             demo_processed['obs'] = [demo_processed['obs'][j] for j in indices]
             demo_processed['grips'] = [demo_processed['grips'][j] for j in indices]
             demo_processed['T_w_es'] = [demo_processed['T_w_es'][j] for j in indices]
         elif n < num_waypoints_demo:
-            # Pad by repeating last waypoint
             while len(demo_processed['obs']) < num_waypoints_demo:
                 demo_processed['obs'].append(demo_processed['obs'][-1])
                 demo_processed['grips'].append(demo_processed['grips'][-1])
@@ -519,7 +762,6 @@ def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_wayp
                                          live_spacing_trans, live_spacing_rot,
                                          subsample=True)
 
-    # Compute offset: each sample produces len(live['obs']) files
     offset = offset_base
     save_sample(full_sample, save_dir=save_dir, offset=offset, scene_encoder=scene_encoder)
 
@@ -527,7 +769,7 @@ def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_wayp
     return num_saved
 
 
-def generate_and_save(shapenet_path, save_dir, num_samples, num_demos=2,
+def generate_and_save(shapenet_path, save_dir, num_samples, num_demos=5,
                       num_waypoints_demo=10, pred_horizon=8,
                       live_spacing_trans=0.01, live_spacing_rot=3,
                       scene_encoder=None, continuous=False, buffer_size=10000,
@@ -587,6 +829,7 @@ def generate_and_save(shapenet_path, save_dir, num_samples, num_demos=2,
 # 8. CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(description='Generate pseudo-demonstrations (Appendix D)')
     parser.add_argument('--shapenet_path', type=str, default=None,
@@ -597,7 +840,7 @@ def main():
     parser.add_argument('--num_val', type=int, default=100,
                         help='Number of validation samples to generate (only used with --val_dir).')
     parser.add_argument('--num_samples', type=int, default=10000)
-    parser.add_argument('--num_demos', type=int, default=2)
+    parser.add_argument('--num_demos', type=int, default=5)
     parser.add_argument('--num_waypoints_demo', type=int, default=10)
     parser.add_argument('--pred_horizon', type=int, default=8)
     parser.add_argument('--continuous', action='store_true',
@@ -628,10 +871,6 @@ def main():
         scene_encoder.eval()
         print("Scene encoder loaded.")
 
-    # Use EGL for headless rendering
-    os.environ['PYOPENGL_PLATFORM'] = 'egl'
-
-    # Generate validation set first (fixed, not overwritten)
     if args.val_dir:
         print(f"Generating {args.num_val} validation samples → {args.val_dir}")
         generate_and_save(
@@ -647,7 +886,6 @@ def main():
             fast=args.fast,
         )
 
-    # Generate training data
     generate_and_save(
         shapenet_path=args.shapenet_path,
         save_dir=args.save_dir,
