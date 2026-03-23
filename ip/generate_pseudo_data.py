@@ -769,7 +769,7 @@ def generate_one_sample(sample_idx, shapenet_path, save_dir, num_demos, num_wayp
     return num_saved
 
 
-def generate_and_save(shapenet_path, save_dir, num_samples, num_demos=5,
+def generate_and_save(shapenet_path, save_dir, num_samples, num_demos=2,
                       num_waypoints_demo=10, pred_horizon=8,
                       live_spacing_trans=0.01, live_spacing_rot=3,
                       scene_encoder=None, continuous=False, buffer_size=10000,
@@ -840,7 +840,7 @@ def main():
     parser.add_argument('--num_val', type=int, default=100,
                         help='Number of validation samples to generate (only used with --val_dir).')
     parser.add_argument('--num_samples', type=int, default=10000)
-    parser.add_argument('--num_demos', type=int, default=5)
+    parser.add_argument('--num_demos', type=int, default=2)
     parser.add_argument('--num_waypoints_demo', type=int, default=10)
     parser.add_argument('--pred_horizon', type=int, default=8)
     parser.add_argument('--continuous', action='store_true',
